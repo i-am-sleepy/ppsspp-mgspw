@@ -5,6 +5,9 @@ on:
       ppsspp_ref:
         description: 'PPSSPP version to build (tag or branch)'
         default: 'v1.20.4'
+      look_buttons:
+        description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
+        default: 'all'
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -15,10 +18,17 @@ jobs:
           ref: ${{ github.event.inputs.ppsspp_ref }}
           submodules: recursive
           fetch-depth: 0
+      - name: Reuse the same signing key every build (so updates install over the top)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
       - name: Apply touch look patch
+        env:
+          LOOK_BUTTONS: ${{ github.event.inputs.look_buttons }}
         run: |
           python3 - <<'PY'
-          import re, sys, pathlib
+          import os, re, sys, pathlib
 
           def edit(path, steps):
               p = pathlib.Path(path)
@@ -30,6 +40,18 @@ jobs:
                   if n != 1:
                       sys.exit('PATCH FAILED: could not find "' + name + '" in ' + path)
               p.write_text(s, encoding='utf-8')
+
+          # Which custom buttons get "hold and slide to look": all, none, or a list like 1,3
+          look = os.environ.get('LOOK_BUTTONS', 'all').strip().lower()
+          mask = 0
+          if look in ('', 'all'):
+              mask = (1 << 64) - 1
+          elif look != 'none':
+              for part in look.split(','):
+                  part = part.strip()
+                  if part.isdigit() and 1 <= int(part) <= 64:
+                      mask |= 1 << (int(part) - 1)
+          print('Look-enabled custom button mask: ' + hex(mask))
 
           edit('Core/HLE/sceCtrl.cpp', [
             ('include', r'(#include <cmath>[^\n]*\n)',
@@ -45,7 +67,7 @@ jobs:
           	touchLookX += dx;
           	touchLookY += dy;
           }
-          '''.replace('\n          ', '\n')),
+          '''),
             ('read', r'(\*data = ctrlBufs\[ctrlBufRead\];[^\n]*\n)',
              lambda m: m.group(1) + '''
           		{
@@ -59,25 +81,60 @@ jobs:
           			data->unused[2] = (u8)(ty & 0xFF);
           			data->unused[3] = (u8)((ty >> 8) & 0xFF);
           		}
-          '''.replace('\n          ', '\n')),
+          '''),
           ])
 
           edit('UI/GamepadEmu.cpp', [
+            ('include map', r'(#include <algorithm>[^\n]*\n)',
+             lambda m: m.group(1) + '#include <map>\n'),
             ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
              lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\n'),
+            ('statics', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)',
+             lambda m: m.group(1) + '''
+          // Touch look on custom buttons: hold one and slide to turn the camera.
+          struct TouchLookState {
+          	int pointer = -1;
+          	float lastX = 0.0f;
+          	float lastY = 0.0f;
+          };
+          static std::map<const void *, TouchLookState> g_touchLook;
+          static const unsigned long long g_touchLookMask = @MASK@ULL;
+          '''.replace('@MASK@', hex(mask))),
+            ('custom touch', r'(bool CustomButton::Touch\(const TouchInput &input\) \{\s*using namespace CustomKeyData;\s*bool lastDown = pointerDownMask_ != 0;\s*bool retval = MultiTouchButton::Touch\(input\);)',
+             lambda m: m.group(1) + '''
+
+          	auto lookIt = g_touchLook.find(this);
+          	if (lookIt != g_touchLook.end()) {
+          		TouchLookState &look = lookIt->second;
+          		if ((input.flags & TOUCH_DOWN) && (pointerDownMask_ & (1 << input.id))) {
+          			look.pointer = input.id;
+          			look.lastX = input.x;
+          			look.lastY = input.y;
+          		}
+          		if ((input.flags & TOUCH_MOVE) && input.id == look.pointer) {
+          			// Stay pressed while the finger slides off the button, and turn the camera.
+          			pointerDownMask_ |= 1 << input.id;
+          			__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
+          			look.lastX = input.x;
+          			look.lastY = input.y;
+          		}
+          		if ((input.flags & TOUCH_UP) && input.id == look.pointer)
+          			look.pointer = -1;
+          		if (input.flags & TOUCH_RELEASE_ALL)
+          			look.pointer = -1;
+          	}
+          '''),
+            ('custom buttons', r'(?m)^([ \t]*)addCustomButton\(g_Config\.CustomButton\[i\], temp, g_Config\.touchCustom\[i\]\);',
+             lambda m: m.group(1) + '''{
+          		if (i == 0)
+          			g_touchLook.clear();
+          		CustomButton *lookBtn = addCustomButton(g_Config.CustomButton[i], temp, g_Config.touchCustom[i]);
+          		if (lookBtn && i < 64 && ((g_touchLookMask >> i) & 1ULL))
+          			g_touchLook[lookBtn] = TouchLookState();
+          	}'''),
             ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
              lambda m: m.group(1) + '\n\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
           ])
-
-          # Give this build its own app id so it installs next to the normal PPSSPP.
-          g = pathlib.Path('android/build.gradle')
-          if g.exists():
-              t = g.read_text(encoding='utf-8')
-              t, n = re.subn(r'(defaultConfig\s*\{)', r'\1\n        applicationIdSuffix ".touch"', t, count=1)
-              if n == 1:
-                  g.write_text(t, encoding='utf-8')
-              else:
-                  print('WARNING: could not set a separate app id; this APK would replace normal PPSSPP')
           print('Patch applied.')
           PY
       - uses: actions/setup-java@v4
