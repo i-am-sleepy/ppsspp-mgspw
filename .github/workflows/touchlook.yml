@@ -148,8 +148,27 @@ jobs:
           java-version: '17'
       - name: Build APK (arm64 only, to save time)
         run: |
-          if [ -f gradlew ]; then bash ./gradlew assembleNormalOptimized -Pandroid.injected.build.abi=arm64-v8a --stacktrace
-          else cd android && bash ./gradlew assembleNormalOptimized -Pandroid.injected.build.abi=arm64-v8a --stacktrace; fi
+          set -o pipefail
+          {
+            if [ -f gradlew ]; then
+              bash ./gradlew assembleNormalOptimized -Pandroid.injected.build.abi=arm64-v8a --stacktrace
+            else
+              cd android && bash ./gradlew assembleNormalOptimized -Pandroid.injected.build.abi=arm64-v8a --stacktrace
+            fi
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+      - name: Show the important error lines
+        if: failure()
+        run: |
+          echo "=== lines containing errors ==="
+          grep -n -E "error:|fatal error|undefined reference|PATCH FAILED|No space left|Killed" build.log | head -40 || true
+          echo "=== context around the first error ==="
+          grep -n -m1 -B4 -A20 "error:" build.log | cut -c1-300 || true
+      - name: Save the full log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
       - name: Collect APK
         run: |
           mkdir out
