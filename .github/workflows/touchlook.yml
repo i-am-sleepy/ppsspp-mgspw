@@ -84,6 +84,15 @@ jobs:
           '''),
           ])
 
+          _gp = pathlib.Path('UI/GamepadEmu.cpp')
+          new_flags = _gp.exists() and ('TouchInputFlags::' in _gp.read_text(encoding='utf-8'))
+          print('Touch flag style: ' + ('TouchInputFlags::X' if new_flags else 'TOUCH_X'))
+
+          def fl(t):
+              for n in ('DOWN', 'MOVE', 'UP', 'RELEASE_ALL'):
+                  t = t.replace('@' + n + '@', ('TouchInputFlags::' if new_flags else 'TOUCH_') + n)
+              return t
+
           edit('UI/GamepadEmu.cpp', [
             ('include map', r'(#include <algorithm>[^\n]*\n)',
              lambda m: m.group(1) + '#include <cstdlib>\n#include <map>\n#include <string>\n'),
@@ -101,7 +110,7 @@ jobs:
           static const unsigned long long g_touchLookMask = @MASK@ULL;
 
           // The custom button number is read from its label, for example "Custom 3 button".
-          static bool TouchLookEnabled(const GamepadView *button) {
+          static bool TouchLookEnabled(const UI::View *button) {
           	if (g_touchLookMask == ~0ULL)
           		return true;
           	std::string text = button->DescribeText();
@@ -112,31 +121,33 @@ jobs:
           			break;
           		}
           	}
+          	if (number == 0)
+          		return true;  // label has no number: cannot tell which button this is
           	return number >= 1 && number <= 64 && ((g_touchLookMask >> (number - 1)) & 1ULL) != 0;
           }
           '''.replace('@MASK@', hex(mask))),
             ('custom touch', r'(bool CustomButton::Touch\(const TouchInput &input\) \{\s*using namespace CustomKeyData;\s*bool lastDown = pointerDownMask_ != 0;\s*bool retval = MultiTouchButton::Touch\(input\);)',
-             lambda m: m.group(1) + '''
+             lambda m: m.group(1) + fl('''
 
           	if (g_touchLookMask != 0 && TouchLookEnabled(this)) {
           		TouchLookState &look = g_touchLook[this];
-          		if ((input.flags & TOUCH_DOWN) && (pointerDownMask_ & (1 << input.id))) {
+          		if ((input.flags & @DOWN@) && (pointerDownMask_ & (1 << input.id))) {
           			look.pointer = input.id;
           			look.lastX = input.x;
           			look.lastY = input.y;
-          		} else if ((input.flags & TOUCH_MOVE) && input.id == look.pointer && lastDown) {
+          		} else if ((input.flags & @MOVE@) && input.id == look.pointer && lastDown) {
           			// Stay pressed while the finger slides off the button, and turn the camera.
           			pointerDownMask_ |= 1 << input.id;
           			__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
           			look.lastX = input.x;
           			look.lastY = input.y;
           		}
-          		if ((input.flags & TOUCH_UP) && input.id == look.pointer)
+          		if ((input.flags & @UP@) && input.id == look.pointer)
           			look.pointer = -1;
-          		if (input.flags & TOUCH_RELEASE_ALL)
+          		if (input.flags & @RELEASE_ALL@)
           			look.pointer = -1;
           	}
-          '''),
+          ''')),
             ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
              lambda m: m.group(1) + '\n\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
           ])
