@@ -7,7 +7,7 @@ on:
         default: 'v1.20.4'
       look_buttons:
         description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
-        default: '1'
+        default: 'all'
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -86,7 +86,7 @@ jobs:
 
           edit('UI/GamepadEmu.cpp', [
             ('include map', r'(#include <algorithm>[^\n]*\n)',
-             lambda m: m.group(1) + '#include <map>\n'),
+             lambda m: m.group(1) + '#include <cstdlib>\n#include <map>\n#include <string>\n'),
             ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
              lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\n'),
             ('statics', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)',
@@ -99,19 +99,32 @@ jobs:
           };
           static std::map<const void *, TouchLookState> g_touchLook;
           static const unsigned long long g_touchLookMask = @MASK@ULL;
+
+          // The custom button number is read from its label, for example "Custom 3 button".
+          static bool TouchLookEnabled(const GamepadView *button) {
+          	if (g_touchLookMask == ~0ULL)
+          		return true;
+          	std::string text = button->DescribeText();
+          	int number = 0;
+          	for (size_t i = 0; i < text.size(); i++) {
+          		if (text[i] >= '0' && text[i] <= '9') {
+          			number = atoi(text.c_str() + i);
+          			break;
+          		}
+          	}
+          	return number >= 1 && number <= 64 && ((g_touchLookMask >> (number - 1)) & 1ULL) != 0;
+          }
           '''.replace('@MASK@', hex(mask))),
             ('custom touch', r'(bool CustomButton::Touch\(const TouchInput &input\) \{\s*using namespace CustomKeyData;\s*bool lastDown = pointerDownMask_ != 0;\s*bool retval = MultiTouchButton::Touch\(input\);)',
              lambda m: m.group(1) + '''
 
-          	auto lookIt = g_touchLook.find(this);
-          	if (lookIt != g_touchLook.end()) {
-          		TouchLookState &look = lookIt->second;
+          	if (g_touchLookMask != 0 && TouchLookEnabled(this)) {
+          		TouchLookState &look = g_touchLook[this];
           		if ((input.flags & TOUCH_DOWN) && (pointerDownMask_ & (1 << input.id))) {
           			look.pointer = input.id;
           			look.lastX = input.x;
           			look.lastY = input.y;
-          		}
-          		if ((input.flags & TOUCH_MOVE) && input.id == look.pointer) {
+          		} else if ((input.flags & TOUCH_MOVE) && input.id == look.pointer && lastDown) {
           			// Stay pressed while the finger slides off the button, and turn the camera.
           			pointerDownMask_ |= 1 << input.id;
           			__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
@@ -124,14 +137,6 @@ jobs:
           			look.pointer = -1;
           	}
           '''),
-            ('custom buttons', r'(?m)^([ \t]*)addCustomButton\(g_Config\.CustomButton\[i\], temp, g_Config\.touchCustom\[i\]\);',
-             lambda m: m.group(1) + '''{
-          		if (i == 0)
-          			g_touchLook.clear();
-          		CustomButton *lookBtn = addCustomButton(g_Config.CustomButton[i], temp, g_Config.touchCustom[i]);
-          		if (lookBtn && i < 64 && ((g_touchLookMask >> i) & 1ULL))
-          			g_touchLook[lookBtn] = TouchLookState();
-          	}'''),
             ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
              lambda m: m.group(1) + '\n\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
           ])
