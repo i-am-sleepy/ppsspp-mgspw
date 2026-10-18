@@ -1,0 +1,99 @@
+name: Build PPSSPP with touch look
+on:
+  workflow_dispatch:
+    inputs:
+      ppsspp_ref:
+        description: 'PPSSPP version to build (tag or branch)'
+        default: 'v1.20.4'
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hrydgard/ppsspp
+          ref: ${{ github.event.inputs.ppsspp_ref }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Apply touch look patch
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+
+          def edit(path, steps):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  sys.exit('PATCH FAILED: missing file ' + path)
+              s = p.read_text(encoding='utf-8')
+              for name, pattern, repl in steps:
+                  s, n = re.subn(pattern, repl, s, count=1)
+                  if n != 1:
+                      sys.exit('PATCH FAILED: could not find "' + name + '" in ' + path)
+              p.write_text(s, encoding='utf-8')
+
+          edit('Core/HLE/sceCtrl.cpp', [
+            ('include', r'(#include <cmath>[^\n]*\n)',
+             lambda m: m.group(1) + '#include <algorithm>\n'),
+            ('mutex', r'(static std::mutex ctrlMutex;[^\n]*\n)',
+             lambda m: m.group(1) + '''
+          // Touch look: finger movement collected since the game last read the pad.
+          static float touchLookX = 0.0f;
+          static float touchLookY = 0.0f;
+
+          void __CtrlAddTouchLook(float dx, float dy) {
+          	std::lock_guard<std::mutex> guard(ctrlMutex);
+          	touchLookX += dx;
+          	touchLookY += dy;
+          }
+          '''.replace('\n          ', '\n')),
+            ('read', r'(\*data = ctrlBufs\[ctrlBufRead\];[^\n]*\n)',
+             lambda m: m.group(1) + '''
+          		{
+          			std::lock_guard<std::mutex> guard(ctrlMutex);
+          			int tx = (int)lroundf(std::max(-2000.0f, std::min(2000.0f, touchLookX)) * 16.0f);
+          			int ty = (int)lroundf(std::max(-2000.0f, std::min(2000.0f, touchLookY)) * 16.0f);
+          			touchLookX = 0.0f;
+          			touchLookY = 0.0f;
+          			data->unused[0] = (u8)(tx & 0xFF);
+          			data->unused[1] = (u8)((tx >> 8) & 0xFF);
+          			data->unused[2] = (u8)(ty & 0xFF);
+          			data->unused[3] = (u8)((ty >> 8) & 0xFF);
+          		}
+          '''.replace('\n          ', '\n')),
+          ])
+
+          edit('UI/GamepadEmu.cpp', [
+            ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
+             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\n'),
+            ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
+             lambda m: m.group(1) + '\n\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
+          ])
+
+          # Give this build its own app id so it installs next to the normal PPSSPP.
+          g = pathlib.Path('android/build.gradle')
+          if g.exists():
+              t = g.read_text(encoding='utf-8')
+              t, n = re.subn(r'(defaultConfig\s*\{)', r'\1\n        applicationIdSuffix ".touch"', t, count=1)
+              if n == 1:
+                  g.write_text(t, encoding='utf-8')
+              else:
+                  print('WARNING: could not set a separate app id; this APK would replace normal PPSSPP')
+          print('Patch applied.')
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - name: Build APK (arm64 only, to save time)
+        run: |
+          if [ -f gradlew ]; then bash ./gradlew assembleNormalOptimized -Pandroid.injected.build.abi=arm64-v8a --stacktrace
+          else cd android && bash ./gradlew assembleNormalOptimized -Pandroid.injected.build.abi=arm64-v8a --stacktrace; fi
+      - name: Collect APK
+        run: |
+          mkdir out
+          find . -name '*.apk' -path '*optimized*' -exec cp {} out/ \;
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppsspp-touch-look
+          path: out/
