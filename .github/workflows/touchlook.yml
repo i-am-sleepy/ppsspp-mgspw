@@ -7,7 +7,7 @@ on:
         default: 'v1.20.4'
       look_buttons:
         description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
-        default: 'all'
+        default: '1'
 jobs:
   apk:
     runs-on: ubuntu-latest
