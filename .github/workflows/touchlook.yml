@@ -8,6 +8,12 @@ on:
       look_buttons:
         description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
         default: 'all'
+      aim_gain:
+        description: 'Aim sensitivity for those games (stick units per swipe step; higher is faster)'
+        default: '6'
+      aim_deadzone:
+        description: 'Skips the game dead zone so slow swipes register (raise if slow swipes do nothing, lower if aim drifts)'
+        default: '20'
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -26,6 +32,8 @@ jobs:
       - name: Apply touch look patch
         env:
           LOOK_BUTTONS: ${{ github.event.inputs.look_buttons }}
+          AIM_GAIN: ${{ github.event.inputs.aim_gain }}
+          AIM_DEADZONE: ${{ github.event.inputs.aim_deadzone }}
         run: |
           python3 - <<'PY'
           import os, re, sys, pathlib
@@ -53,9 +61,88 @@ jobs:
                       mask |= 1 << (int(part) - 1)
           print('Look-enabled custom button mask: ' + hex(mask))
 
+          AIM_CPP = '''
+          // ---- Touch aim: a swipe goes straight into the LEFT stick data the game reads ----
+          // Used while the right-side gesture zone has "analog stick gesture" switched on. No on-screen stick
+          // emulation: all movement between game reads is added up, a dead zone offset makes slow swipes
+          // register, and any overflow is carried into the next read.
+          static float touchAimX = 0.0f;
+          static float touchAimY = 0.0f;
+          static float aimCarryX = 0.0f;
+          static float aimCarryY = 0.0f;
+          static std::chrono::steady_clock::time_point lastAimEvent;
+
+          void __CtrlAddTouchAim(float dx, float dy) {
+          	std::lock_guard<std::mutex> guard(ctrlMutex);
+          	touchAimX += dx;
+          	touchAimY += dy;
+          	lastAimEvent = std::chrono::steady_clock::now();
+          }
+
+          static int TouchAimShape(float v, float &carry) {
+          	const float deadzone = @DZ@f;
+          	float m = v < 0.0f ? -v : v;
+          	if (m < 0.5f) {
+          		carry = 0.0f;
+          		return 0;
+          	}
+          	float room = 127.0f - deadzone;
+          	float used = m < room ? m : room;
+          	float rest = m - used;
+          	if (rest > 150.0f)
+          		rest = 150.0f;
+          	carry = v < 0.0f ? -rest : rest;
+          	int out = (int)lroundf(deadzone + used);
+          	return v < 0.0f ? -out : out;
+          }
+
+          template <class P>
+          static void TouchAimApply(P &pad, float ax, float ay) {
+          	bool recent = (std::chrono::steady_clock::now() - lastAimEvent) < std::chrono::milliseconds(120);
+          	int sx = TouchAimShape(ax * @AIMGAIN@f + aimCarryX, aimCarryX);
+          	int sy = TouchAimShape(ay * @AIMGAIN@f + aimCarryY, aimCarryY);
+          	if (!recent && sx == 0 && sy == 0)
+          		return;
+          	u8 *raw = (u8 *)&pad->buttons - 4;
+          	raw[8] = (u8)std::max(1, std::min(255, 128 + sx));
+          	raw[9] = (u8)std::max(1, std::min(255, 128 + sy));
+          }
+          '''
+
+          aim_gain = repr(float(os.environ.get('AIM_GAIN', '6').strip() or '6'))
+          aim_deadzone = repr(float(os.environ.get('AIM_DEADZONE', '20').strip() or '20'))
+          aim_code = AIM_CPP.replace('@DZ@', aim_deadzone).replace('@AIMGAIN@', aim_gain)
+
+
+          def find_analog_field():
+              # Find the name of the "analog stick gesture" switch inside PPSSPP's gesture-zone settings.
+              hits = []
+              for path in list(pathlib.Path('Core').rglob('*.h')) + list(pathlib.Path('UI').rglob('*.h')):
+                  try:
+                      text = path.read_text(encoding='utf-8', errors='ignore')
+                  except Exception:
+                      continue
+                  m = re.search(r'struct\s+GestureControlConfig\s*\{(.*?)\n\s*\};', text, re.S)
+                  if m:
+                      hits.append(str(path))
+                      f = re.search(r'bool\s+(\w*[Aa]nalog\w*)\s*[;=\{]', m.group(1))
+                      if f:
+                          return f.group(1)
+                      print('GestureControlConfig found in ' + str(path) + ' but no analog switch inside:')
+                      print(m.group(1))
+              gp = pathlib.Path('UI/GamepadEmu.cpp')
+              if gp.exists():
+                  for n, line in enumerate(gp.read_text(encoding='utf-8', errors='ignore').splitlines(), 1):
+                      if 'nalog' in line and ('Zone' in line or 'zone' in line or 'Gesture' in line):
+                          print('GamepadEmu.cpp:%d: %s' % (n, line.strip()))
+              sys.exit('PATCH FAILED: could not find the analog gesture switch (looked in: ' + ', '.join(hits) + ')')
+
+          analog_field = find_analog_field()
+          print('Right-zone analog gesture switch: ' + analog_field)
+
           edit('Core/HLE/sceCtrl.cpp', [
             ('include', r'(#include <cmath>[^\n]*\n)',
-             lambda m: m.group(1) + '#include <algorithm>\n'),
+             lambda m: m.group(1) + '#include <algorithm>\n#include <chrono>\n'),
             ('mutex', r'(static std::mutex ctrlMutex;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look: finger movement collected since the game last read the pad.
@@ -67,7 +154,7 @@ jobs:
           	touchLookX += dx;
           	touchLookY += dy;
           }
-          '''),
+          ''' + aim_code),
             ('read', r'(\*data = ctrlBufs\[ctrlBufRead\];[^\n]*\n)',
              lambda m: m.group(1) + '''
           		{
@@ -80,6 +167,11 @@ jobs:
           			data->unused[1] = (u8)((tx >> 8) & 0xFF);
           			data->unused[2] = (u8)(ty & 0xFF);
           			data->unused[3] = (u8)((ty >> 8) & 0xFF);
+          			float aimX = touchAimX;
+          			float aimY = touchAimY;
+          			touchAimX = 0.0f;
+          			touchAimY = 0.0f;
+          			TouchAimApply(data, aimX, aimY);
           		}
           '''),
           ])
@@ -97,7 +189,7 @@ jobs:
             ('include map', r'(#include <algorithm>[^\n]*\n)',
              lambda m: m.group(1) + '#include <cstdlib>\n#include <map>\n#include <string>\n'),
             ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
-             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\n'),
+             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\nvoid __CtrlAddTouchAim(float dx, float dy);\n'),
             ('statics', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look on custom buttons: hold one and slide to turn the camera.
@@ -107,6 +199,8 @@ jobs:
           	float lastY = 0.0f;
           };
           static std::map<const void *, TouchLookState> g_touchLook;
+          // True while the right-side gesture zone has its analog stick gesture switched on.
+          static bool g_touchAimRightZone = false;
           static const unsigned long long g_touchLookMask = @MASK@ULL;
 
           // The custom button number is read from its label, for example "Custom 3 button".
@@ -138,7 +232,10 @@ jobs:
           		} else if ((input.flags & @MOVE@) && input.id == look.pointer && lastDown) {
           			// Stay pressed while the finger slides off the button, and turn the camera.
           			pointerDownMask_ |= 1 << input.id;
-          			__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
+          			if (g_touchAimRightZone)
+          				__CtrlAddTouchAim((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
+          			else
+          				__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
           			look.lastX = input.x;
           			look.lastY = input.y;
           		}
@@ -149,7 +246,11 @@ jobs:
           	}
           ''')),
             ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
-             lambda m: m.group(1) + '\n\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
+             lambda m: m.group(1) + '\n\t\t\tif (zoneIndex_ == 1 && g_touchAimRightZone)\n\t\t\t\t__CtrlAddTouchAim((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);\n\t\t\telse\n\t\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
+            ('update', r'(void GestureGamepad::Update\(\)\s*\{)',
+             lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = GetZone().' + analog_field + ';'),
+            ('destructor', r'(GestureGamepad::~GestureGamepad\(\)\s*\{)',
+             lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = false;'),
           ])
           print('Patch applied.')
           PY
