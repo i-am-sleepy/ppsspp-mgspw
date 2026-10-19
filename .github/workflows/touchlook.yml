@@ -115,27 +115,28 @@ jobs:
 
 
           def find_analog_field():
-              # Find the name of the "analog stick gesture" switch inside PPSSPP's gesture-zone settings.
-              hits = []
-              for path in list(pathlib.Path('Core').rglob('*.h')) + list(pathlib.Path('UI').rglob('*.h')):
+              # Find the name of the "analog stick gesture" switch of a gesture zone.
+              gp = pathlib.Path('UI/GamepadEmu.cpp')
+              text = gp.read_text(encoding='utf-8', errors='ignore') if gp.exists() else ''
+              for pattern in (r'GetZone\(\)\s*\.\s*(b\w*Analog\w*)', r'\bzone\s*\.\s*(b\w*Analog\w*)',
+                              r'gestureControls\[[^\]]*\]\s*\.\s*(b\w*Analog\w*)'):
+                  m = re.search(pattern, text)
+                  if m:
+                      return m.group(1)
+              for path in list(pathlib.Path('Core').rglob('*.h')) + list(pathlib.Path('UI').rglob('*.h')) + list(pathlib.Path('Common').rglob('*.h')):
                   try:
-                      text = path.read_text(encoding='utf-8', errors='ignore')
+                      t = path.read_text(encoding='utf-8', errors='ignore')
                   except Exception:
                       continue
-                  m = re.search(r'struct\s+GestureControlConfig\s*\{(.*?)\n\s*\};', text, re.S)
+                  m = re.search(r'struct\s+GestureControlConfig\s*\{(.*?)\n\s*\};', t, re.S)
                   if m:
-                      hits.append(str(path))
                       f = re.search(r'bool\s+(\w*[Aa]nalog\w*)\s*[;=\{]', m.group(1))
                       if f:
                           return f.group(1)
-                      print('GestureControlConfig found in ' + str(path) + ' but no analog switch inside:')
-                      print(m.group(1))
-              gp = pathlib.Path('UI/GamepadEmu.cpp')
-              if gp.exists():
-                  for n, line in enumerate(gp.read_text(encoding='utf-8', errors='ignore').splitlines(), 1):
-                      if 'nalog' in line and ('Zone' in line or 'zone' in line or 'Gesture' in line):
-                          print('GamepadEmu.cpp:%d: %s' % (n, line.strip()))
-              sys.exit('PATCH FAILED: could not find the analog gesture switch (looked in: ' + ', '.join(hits) + ')')
+              for n, line in enumerate(text.splitlines(), 1):
+                  if 'nalog' in line:
+                      print('GamepadEmu.cpp:%d: %s' % (n, line.strip()))
+              sys.exit('PATCH FAILED: could not find the analog gesture switch')
 
           analog_field = find_analog_field()
           print('Right-zone analog gesture switch: ' + analog_field)
@@ -249,9 +250,16 @@ jobs:
              lambda m: m.group(1) + '\n\t\t\tif (zoneIndex_ == 1 && g_touchAimRightZone)\n\t\t\t\t__CtrlAddTouchAim((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);\n\t\t\telse\n\t\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
             ('update', r'(void GestureGamepad::Update\(\)\s*\{)',
              lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = GetZone().' + analog_field + ';'),
-            ('destructor', r'(GestureGamepad::~GestureGamepad\(\)\s*\{)',
-             lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = false;'),
           ])
+          # Optional: forget the switch when the right zone goes away (not essential if it cannot be found).
+          _gp = pathlib.Path('UI/GamepadEmu.cpp')
+          _txt = _gp.read_text(encoding='utf-8')
+          _txt, _n = re.subn(r'(GestureGamepad::~GestureGamepad\(\)\s*\{)',
+                             lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = false;', _txt, count=1)
+          if _n == 1:
+              _gp.write_text(_txt, encoding='utf-8')
+          else:
+              print('Note: right-zone cleanup step not found (harmless).')
           print('Patch applied.')
           PY
       - uses: actions/setup-java@v4
