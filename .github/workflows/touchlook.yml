@@ -74,6 +74,17 @@ jobs:
           static float aimPrevX = 0.0f;
           static float aimPrevY = 0.0f;
           static std::chrono::steady_clock::time_point lastAimEvent;
+          // While the right-side finger is down we own the left stick completely (neutral when it is not moving),
+          // so PPSSPP's own analog gesture cannot keep pushing the stick underneath.
+          static bool touchAimHeld = false;
+          static std::chrono::steady_clock::time_point aimReleasedAt;
+
+          void __CtrlSetTouchAimHeld(bool held) {
+          	std::lock_guard<std::mutex> guard(ctrlMutex);
+          	if (touchAimHeld && !held)
+          		aimReleasedAt = std::chrono::steady_clock::now();
+          	touchAimHeld = held;
+          }
 
           void __CtrlAddTouchAim(float dx, float dy) {
           	std::lock_guard<std::mutex> guard(ctrlMutex);
@@ -122,8 +133,10 @@ jobs:
 
           template <class P>
           static void TouchAimApply(P &pad, float ax, float ay) {
-          	bool recent = (std::chrono::steady_clock::now() - lastAimEvent) < std::chrono::milliseconds(120);
-          	if (!recent) {
+          	auto nowT = std::chrono::steady_clock::now();
+          	bool recent = (nowT - lastAimEvent) < std::chrono::milliseconds(120);
+          	bool own = touchAimHeld || (nowT - aimReleasedAt) < std::chrono::milliseconds(150);
+          	if (!recent && !touchAimHeld) {
           		aimPrevX = 0.0f;
           		aimPrevY = 0.0f;
           		aimCarryX = 0.0f;
@@ -134,11 +147,13 @@ jobs:
           	float ty = TouchAimShape(ay * t.gain + aimCarryY, aimCarryY, t);
           	aimPrevX = tx + (aimPrevX - tx) * t.smooth;
           	aimPrevY = ty + (aimPrevY - ty) * t.smooth;
+          	if (tx == 0.0f && aimPrevX > -t.deadzone && aimPrevX < t.deadzone) aimPrevX = 0.0f;
+          	if (ty == 0.0f && aimPrevY > -t.deadzone && aimPrevY < t.deadzone) aimPrevY = 0.0f;
           	if (aimPrevX > -1.0f && aimPrevX < 1.0f) aimPrevX = 0.0f;
           	if (aimPrevY > -1.0f && aimPrevY < 1.0f) aimPrevY = 0.0f;
           	int sx = (int)lroundf(aimPrevX);
           	int sy = (int)lroundf(aimPrevY);
-          	if (!recent && sx == 0 && sy == 0)
+          	if (!own && !recent && sx == 0 && sy == 0)
           		return;
           	u8 *raw = (u8 *)&pad->buttons - 4;
           	raw[8] = (u8)std::max(1, std::min(255, 128 + sx));
@@ -227,7 +242,7 @@ jobs:
             ('include map', r'(#include <algorithm>[^\n]*\n)',
              lambda m: m.group(1) + '#include <cstdlib>\n#include <map>\n#include <string>\n'),
             ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
-             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\nvoid __CtrlAddTouchAim(float dx, float dy);\n'),
+             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\nvoid __CtrlAddTouchAim(float dx, float dy);\nvoid __CtrlSetTouchAimHeld(bool held);\n'),
             ('statics', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look on custom buttons: hold one and slide to turn the camera.
@@ -298,6 +313,8 @@ jobs:
           		~AimTrack() {
           			if (self->zoneIndex_ != 1 || !g_touchAimRightZone) {
           				g_aimPointer = -1;
+          				if (self->zoneIndex_ == 1)
+          					__CtrlSetTouchAimHeld(false);
           				return;
           			}
           			if (g_aimPointer == -1) {
@@ -315,6 +332,7 @@ jobs:
           				g_aimPointer = -1;
           			if (in.flags & @RELEASE_ALL@)
           				g_aimPointer = -1;
+          			__CtrlSetTouchAimHeld(g_aimPointer != -1);
           		}
           	} aimTrack{this, input};
           ''')),
