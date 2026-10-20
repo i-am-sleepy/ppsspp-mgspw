@@ -9,11 +9,11 @@ on:
         description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
         default: 'all'
       aim_gain:
-        description: 'Aim sensitivity for those games (stick units per swipe step; higher is faster)'
-        default: '6'
+        description: 'Starting aim speed (can be changed later with the tuning cheat, no rebuild)'
+        default: '12'
       aim_deadzone:
-        description: 'Skips the game dead zone so slow swipes register (raise if slow swipes do nothing, lower if aim drifts)'
-        default: '20'
+        description: 'Starting dead zone skip (can be changed later with the tuning cheat, no rebuild)'
+        default: '30'
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -64,12 +64,15 @@ jobs:
           AIM_CPP = '''
           // ---- Touch aim: a swipe goes straight into the LEFT stick data the game reads ----
           // Used while the right-side gesture zone has "analog stick gesture" switched on. No on-screen stick
-          // emulation: all movement between game reads is added up, a dead zone offset makes slow swipes
-          // register, and any overflow is carried into the next read.
+          // emulation: all movement between game reads is added up, shaped to skip the game's dead zone,
+          // eased so it does not flicker, and any overflow is carried into the next read.
+          // The numbers can be changed live by a cheat that writes to game RAM at 0x08800F40 (see the tuning cheat).
           static float touchAimX = 0.0f;
           static float touchAimY = 0.0f;
           static float aimCarryX = 0.0f;
           static float aimCarryY = 0.0f;
+          static float aimPrevX = 0.0f;
+          static float aimPrevY = 0.0f;
           static std::chrono::steady_clock::time_point lastAimEvent;
 
           void __CtrlAddTouchAim(float dx, float dy) {
@@ -79,28 +82,62 @@ jobs:
           	lastAimEvent = std::chrono::steady_clock::now();
           }
 
-          static int TouchAimShape(float v, float &carry) {
-          	const float deadzone = @DZ@f;
+          struct AimTuning {
+          	float gain;
+          	float deadzone;
+          	float curve;
+          	float smooth;
+          };
+
+          static AimTuning GetAimTuning() {
+          	AimTuning t = { @AIMGAIN@f, @DZ@f, 0.6f, 0.35f };
+          	if (Memory::IsValidAddress(0x08800F40) && Memory::Read_U32(0x08800F40) == 0x41494D31) {
+          		t.gain = (float)Memory::Read_U32(0x08800F44) / 10.0f;
+          		t.deadzone = (float)Memory::Read_U32(0x08800F48);
+          		t.curve = (float)Memory::Read_U32(0x08800F4C) / 100.0f;
+          		t.smooth = (float)Memory::Read_U32(0x08800F50) / 100.0f;
+          	}
+          	t.gain = std::max(0.1f, std::min(200.0f, t.gain));
+          	t.deadzone = std::max(0.0f, std::min(100.0f, t.deadzone));
+          	t.curve = std::max(0.2f, std::min(2.0f, t.curve));
+          	t.smooth = std::max(0.0f, std::min(0.9f, t.smooth));
+          	return t;
+          }
+
+          static float TouchAimShape(float v, float &carry, const AimTuning &t) {
           	float m = v < 0.0f ? -v : v;
           	if (m < 0.5f) {
           		carry = 0.0f;
-          		return 0;
+          		return 0.0f;
           	}
-          	float room = 127.0f - deadzone;
+          	float room = 127.0f - t.deadzone;
           	float used = m < room ? m : room;
           	float rest = m - used;
           	if (rest > 150.0f)
           		rest = 150.0f;
           	carry = v < 0.0f ? -rest : rest;
-          	int out = (int)lroundf(deadzone + used);
+          	float out = t.deadzone + powf(used / room, t.curve) * room;
           	return v < 0.0f ? -out : out;
           }
 
           template <class P>
           static void TouchAimApply(P &pad, float ax, float ay) {
           	bool recent = (std::chrono::steady_clock::now() - lastAimEvent) < std::chrono::milliseconds(120);
-          	int sx = TouchAimShape(ax * @AIMGAIN@f + aimCarryX, aimCarryX);
-          	int sy = TouchAimShape(ay * @AIMGAIN@f + aimCarryY, aimCarryY);
+          	if (!recent) {
+          		aimPrevX = 0.0f;
+          		aimPrevY = 0.0f;
+          		aimCarryX = 0.0f;
+          		aimCarryY = 0.0f;
+          	}
+          	AimTuning t = GetAimTuning();
+          	float tx = TouchAimShape(ax * t.gain + aimCarryX, aimCarryX, t);
+          	float ty = TouchAimShape(ay * t.gain + aimCarryY, aimCarryY, t);
+          	aimPrevX = tx + (aimPrevX - tx) * t.smooth;
+          	aimPrevY = ty + (aimPrevY - ty) * t.smooth;
+          	if (aimPrevX > -1.0f && aimPrevX < 1.0f) aimPrevX = 0.0f;
+          	if (aimPrevY > -1.0f && aimPrevY < 1.0f) aimPrevY = 0.0f;
+          	int sx = (int)lroundf(aimPrevX);
+          	int sy = (int)lroundf(aimPrevY);
           	if (!recent && sx == 0 && sy == 0)
           		return;
           	u8 *raw = (u8 *)&pad->buttons - 4;
@@ -109,8 +146,8 @@ jobs:
           }
           '''
 
-          aim_gain = repr(float(os.environ.get('AIM_GAIN', '6').strip() or '6'))
-          aim_deadzone = repr(float(os.environ.get('AIM_DEADZONE', '20').strip() or '20'))
+          aim_gain = repr(float(os.environ.get('AIM_GAIN', '12').strip() or '12'))
+          aim_deadzone = repr(float(os.environ.get('AIM_DEADZONE', '30').strip() or '30'))
           aim_code = AIM_CPP.replace('@DZ@', aim_deadzone).replace('@AIMGAIN@', aim_gain)
 
 
@@ -143,7 +180,7 @@ jobs:
 
           edit('Core/HLE/sceCtrl.cpp', [
             ('include', r'(#include <cmath>[^\n]*\n)',
-             lambda m: m.group(1) + '#include <algorithm>\n#include <chrono>\n'),
+             lambda m: m.group(1) + '#include <algorithm>\n#include <chrono>\n#include "Core/MemMap.h"\n'),
             ('mutex', r'(static std::mutex ctrlMutex;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look: finger movement collected since the game last read the pad.
