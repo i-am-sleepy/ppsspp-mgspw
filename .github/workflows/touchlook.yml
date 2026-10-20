@@ -8,12 +8,12 @@ on:
       look_buttons:
         description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
         default: 'all'
-      aim_gain:
-        description: 'Starting aim speed (can be changed later with the tuning cheat, no rebuild)'
-        default: '12'
-      aim_deadzone:
-        description: 'Starting dead zone skip (can be changed later with the tuning cheat, no rebuild)'
-        default: '30'
+      native_look_sensitivity:
+        description: 'Native touch look (right gesture zone + analog gesture only): sensitivity, 1.0 = default'
+        default: '1.0'
+      native_look_invert_y:
+        description: 'Native touch look: invert vertical look (true or false)'
+        default: 'false'
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -32,8 +32,6 @@ jobs:
       - name: Apply touch look patch
         env:
           LOOK_BUTTONS: ${{ github.event.inputs.look_buttons }}
-          AIM_GAIN: ${{ github.event.inputs.aim_gain }}
-          AIM_DEADZONE: ${{ github.event.inputs.aim_deadzone }}
         run: |
           python3 - <<'PY'
           import os, re, sys, pathlib
@@ -61,126 +59,9 @@ jobs:
                       mask |= 1 << (int(part) - 1)
           print('Look-enabled custom button mask: ' + hex(mask))
 
-          AIM_CPP = '''
-          // ---- Touch aim: a swipe goes straight into the LEFT stick data the game reads ----
-          // Used while the right-side gesture zone has "analog stick gesture" switched on. No on-screen stick
-          // emulation: all movement between game reads is added up, shaped to skip the game's dead zone,
-          // eased so it does not flicker, and any overflow is carried into the next read.
-          // The numbers can be changed live by a cheat that writes to game RAM at 0x08800F40 (see the tuning cheat).
-          static float touchAimX = 0.0f;
-          static float touchAimY = 0.0f;
-          static float aimCarryX = 0.0f;
-          static float aimCarryY = 0.0f;
-          static float aimPrevX = 0.0f;
-          static float aimPrevY = 0.0f;
-          static std::chrono::steady_clock::time_point lastAimEvent;
-
-          void __CtrlAddTouchAim(float dx, float dy) {
-          	std::lock_guard<std::mutex> guard(ctrlMutex);
-          	touchAimX += dx;
-          	touchAimY += dy;
-          	lastAimEvent = std::chrono::steady_clock::now();
-          }
-
-          struct AimTuning {
-          	float gain;
-          	float deadzone;
-          	float curve;
-          	float smooth;
-          };
-
-          static AimTuning GetAimTuning() {
-          	AimTuning t = { @AIMGAIN@f, @DZ@f, 0.6f, 0.35f };
-          	if (Memory::IsValidAddress(0x08800F40) && Memory::Read_U32(0x08800F40) == 0x41494D31) {
-          		t.gain = (float)Memory::Read_U32(0x08800F44) / 10.0f;
-          		t.deadzone = (float)Memory::Read_U32(0x08800F48);
-          		t.curve = (float)Memory::Read_U32(0x08800F4C) / 100.0f;
-          		t.smooth = (float)Memory::Read_U32(0x08800F50) / 100.0f;
-          	}
-          	t.gain = std::max(0.1f, std::min(200.0f, t.gain));
-          	t.deadzone = std::max(0.0f, std::min(100.0f, t.deadzone));
-          	t.curve = std::max(0.2f, std::min(2.0f, t.curve));
-          	t.smooth = std::max(0.0f, std::min(0.9f, t.smooth));
-          	return t;
-          }
-
-          static float TouchAimShape(float v, float &carry, const AimTuning &t) {
-          	float m = v < 0.0f ? -v : v;
-          	if (m < 0.5f) {
-          		carry = 0.0f;
-          		return 0.0f;
-          	}
-          	float room = 127.0f - t.deadzone;
-          	float used = m < room ? m : room;
-          	float rest = m - used;
-          	if (rest > 150.0f)
-          		rest = 150.0f;
-          	carry = v < 0.0f ? -rest : rest;
-          	float out = t.deadzone + powf(used / room, t.curve) * room;
-          	return v < 0.0f ? -out : out;
-          }
-
-          template <class P>
-          static void TouchAimApply(P &pad, float ax, float ay) {
-          	bool recent = (std::chrono::steady_clock::now() - lastAimEvent) < std::chrono::milliseconds(120);
-          	if (!recent) {
-          		aimPrevX = 0.0f;
-          		aimPrevY = 0.0f;
-          		aimCarryX = 0.0f;
-          		aimCarryY = 0.0f;
-          	}
-          	AimTuning t = GetAimTuning();
-          	float tx = TouchAimShape(ax * t.gain + aimCarryX, aimCarryX, t);
-          	float ty = TouchAimShape(ay * t.gain + aimCarryY, aimCarryY, t);
-          	aimPrevX = tx + (aimPrevX - tx) * t.smooth;
-          	aimPrevY = ty + (aimPrevY - ty) * t.smooth;
-          	if (aimPrevX > -1.0f && aimPrevX < 1.0f) aimPrevX = 0.0f;
-          	if (aimPrevY > -1.0f && aimPrevY < 1.0f) aimPrevY = 0.0f;
-          	int sx = (int)lroundf(aimPrevX);
-          	int sy = (int)lroundf(aimPrevY);
-          	if (!recent && sx == 0 && sy == 0)
-          		return;
-          	u8 *raw = (u8 *)&pad->buttons - 4;
-          	raw[8] = (u8)std::max(1, std::min(255, 128 + sx));
-          	raw[9] = (u8)std::max(1, std::min(255, 128 + sy));
-          }
-          '''
-
-          aim_gain = repr(float(os.environ.get('AIM_GAIN', '12').strip() or '12'))
-          aim_deadzone = repr(float(os.environ.get('AIM_DEADZONE', '30').strip() or '30'))
-          aim_code = AIM_CPP.replace('@DZ@', aim_deadzone).replace('@AIMGAIN@', aim_gain)
-
-
-          def find_analog_field():
-              # Find the name of the "analog stick gesture" switch of a gesture zone.
-              gp = pathlib.Path('UI/GamepadEmu.cpp')
-              text = gp.read_text(encoding='utf-8', errors='ignore') if gp.exists() else ''
-              for pattern in (r'GetZone\(\)\s*\.\s*(b\w*Analog\w*)', r'\bzone\s*\.\s*(b\w*Analog\w*)',
-                              r'gestureControls\[[^\]]*\]\s*\.\s*(b\w*Analog\w*)'):
-                  m = re.search(pattern, text)
-                  if m:
-                      return m.group(1)
-              for path in list(pathlib.Path('Core').rglob('*.h')) + list(pathlib.Path('UI').rglob('*.h')) + list(pathlib.Path('Common').rglob('*.h')):
-                  try:
-                      t = path.read_text(encoding='utf-8', errors='ignore')
-                  except Exception:
-                      continue
-                  m = re.search(r'struct\s+GestureControlConfig\s*\{(.*?)\n\s*\};', t, re.S)
-                  if m:
-                      f = re.search(r'bool\s+(\w*[Aa]nalog\w*)\s*[;=\{]', m.group(1))
-                      if f:
-                          return f.group(1)
-              for n, line in enumerate(text.splitlines(), 1):
-                  if 'nalog' in line:
-                      print('GamepadEmu.cpp:%d: %s' % (n, line.strip()))
-              sys.exit('PATCH FAILED: could not find the analog gesture switch')
-
-          analog_field = find_analog_field()
-          print('Right-zone analog gesture switch: ' + analog_field)
-
           edit('Core/HLE/sceCtrl.cpp', [
             ('include', r'(#include <cmath>[^\n]*\n)',
-             lambda m: m.group(1) + '#include <algorithm>\n#include <chrono>\n#include "Core/MemMap.h"\n'),
+             lambda m: m.group(1) + '#include <algorithm>\n'),
             ('mutex', r'(static std::mutex ctrlMutex;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look: finger movement collected since the game last read the pad.
@@ -192,7 +73,7 @@ jobs:
           	touchLookX += dx;
           	touchLookY += dy;
           }
-          ''' + aim_code),
+          '''),
             ('read', r'(\*data = ctrlBufs\[ctrlBufRead\];[^\n]*\n)',
              lambda m: m.group(1) + '''
           		{
@@ -205,11 +86,6 @@ jobs:
           			data->unused[1] = (u8)((tx >> 8) & 0xFF);
           			data->unused[2] = (u8)(ty & 0xFF);
           			data->unused[3] = (u8)((ty >> 8) & 0xFF);
-          			float aimX = touchAimX;
-          			float aimY = touchAimY;
-          			touchAimX = 0.0f;
-          			touchAimY = 0.0f;
-          			TouchAimApply(data, aimX, aimY);
           		}
           '''),
           ])
@@ -227,7 +103,7 @@ jobs:
             ('include map', r'(#include <algorithm>[^\n]*\n)',
              lambda m: m.group(1) + '#include <cstdlib>\n#include <map>\n#include <string>\n'),
             ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
-             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\nvoid __CtrlAddTouchAim(float dx, float dy);\n'),
+             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\n'),
             ('statics', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look on custom buttons: hold one and slide to turn the camera.
@@ -237,8 +113,6 @@ jobs:
           	float lastY = 0.0f;
           };
           static std::map<const void *, TouchLookState> g_touchLook;
-          // True while the right-side gesture zone has its analog stick gesture switched on.
-          static bool g_touchAimRightZone = false;
           static const unsigned long long g_touchLookMask = @MASK@ULL;
 
           // The custom button number is read from its label, for example "Custom 3 button".
@@ -270,10 +144,7 @@ jobs:
           		} else if ((input.flags & @MOVE@) && input.id == look.pointer && lastDown) {
           			// Stay pressed while the finger slides off the button, and turn the camera.
           			pointerDownMask_ |= 1 << input.id;
-          			if (g_touchAimRightZone)
-          				__CtrlAddTouchAim((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
-          			else
-          				__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
+          			__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
           			look.lastX = input.x;
           			look.lastY = input.y;
           		}
@@ -284,21 +155,171 @@ jobs:
           	}
           ''')),
             ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
-             lambda m: m.group(1) + '\n\t\t\tif (zoneIndex_ == 1 && g_touchAimRightZone)\n\t\t\t\t__CtrlAddTouchAim((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);\n\t\t\telse\n\t\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
-            ('update', r'(void GestureGamepad::Update\(\)\s*\{)',
-             lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = GetZone().' + analog_field + ';'),
+             lambda m: m.group(1) + '\n\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
           ])
-          # Optional: forget the switch when the right zone goes away (not essential if it cannot be found).
-          _gp = pathlib.Path('UI/GamepadEmu.cpp')
-          _txt = _gp.read_text(encoding='utf-8')
-          _txt, _n = re.subn(r'(GestureGamepad::~GestureGamepad\(\)\s*\{)',
-                             lambda m: m.group(1) + '\n\tif (zoneIndex_ == 1)\n\t\tg_touchAimRightZone = false;', _txt, count=1)
-          if _n == 1:
-              _gp.write_text(_txt, encoding='utf-8')
-          else:
-              print('Note: right-zone cleanup step not found (harmless).')
           print('Patch applied.')
           PY
+      - name: Apply native touch look patch (right gesture zone analog only)
+        env:
+          NL_SENS: ${{ github.event.inputs.native_look_sensitivity }}
+          NL_INVERT_Y: ${{ github.event.inputs.native_look_invert_y }}
+        run: |
+          python3 - <<'NLPY'
+          import os, re, sys, pathlib
+
+          def edit(path, steps):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  sys.exit('PATCH FAILED: missing file ' + path)
+              s = p.read_text(encoding='utf-8')
+              for name, pattern, repl in steps:
+                  s, n = re.subn(pattern, repl, s, count=1)
+                  if n != 1:
+                      sys.exit('PATCH FAILED: could not find "' + name + '" in ' + path)
+              p.write_text(s, encoding='utf-8')
+
+          def num(env, default, lo, hi):
+              try:
+                  v = float(os.environ.get(env, default))
+              except ValueError:
+                  v = float(default)
+              return max(lo, min(hi, v))
+
+          sens = num('NL_SENS', '1.0', 0.05, 10.0)
+          invert = os.environ.get('NL_INVERT_Y', 'false').strip().lower() in ('1', 'true', 'yes')
+          print('Native look: sensitivity ' + str(sens) + ', invert Y ' + str(invert))
+
+          # Stops the stock analog-gesture code from writing the left stick, but ONLY while the
+          # right-zone native look is active. Everywhere else this flag stays false, so nothing changes.
+          edit('Core/HLE/sceCtrl.cpp', [
+            ('analog xy', r'(void __CtrlSetAnalogXY\(int stick, float x, float y\)\s*\{)',
+             lambda m: 'static thread_local bool g_nativeLookSuppressLeft = false;\n'
+                       'void __CtrlSuppressLeftStick(bool suppress) {\n\tg_nativeLookSuppressLeft = suppress;\n}\n\n'
+                       + m.group(1) + '\n\tif (stick == 0 && g_nativeLookSuppressLeft)\n\t\treturn;'),
+          ])
+
+          _gp = pathlib.Path('UI/GamepadEmu.cpp')
+          if not _gp.exists():
+              sys.exit('PATCH FAILED: missing file UI/GamepadEmu.cpp')
+          _t = _gp.read_text(encoding='utf-8')
+          new_flags = 'TouchInputFlags::' in _t
+          print('Touch flag style: ' + ('TouchInputFlags::X' if new_flags else 'TOUCH_X'))
+
+          def fl(t):
+              for n in ('DOWN', 'MOVE', 'UP', 'RELEASE_ALL'):
+                  t = t.replace('@' + n + '@', ('TouchInputFlags::' if new_flags else 'TOUCH_') + n)
+              return t
+
+          NL_BLOCK = fl('''
+          // ---- Native touch look: right gesture zone + "analog gesture" enabled ----
+          // Finger speed (not distance from where you touched down) drives the left analog stick.
+          // Does nothing unless GestureGamepad zone 1 has the analog gesture option turned on.
+          void __CtrlSuppressLeftStick(bool suppress);
+
+          namespace {
+          struct NativeLookState {
+          	int pointer = -1;
+          	float lastX = 0.0f;
+          	float lastY = 0.0f;
+          	float accX = 0.0f;   // finger movement in pixels since the last frame
+          	float accY = 0.0f;
+          	float outX = 0.0f;   // smoothed stick value
+          	float outY = 0.0f;
+          	bool active = false; // we have written a stick value that must be cleared later
+          };
+          NativeLookState g_nl;
+          const float NL_SENS = @SENS@f;
+          const float NL_INVERT_Y = @INVY@f;
+          const float NL_PIXELS_FOR_FULL = 40.0f;  // pixels per frame that equal full stick
+          const float NL_SMOOTH = 0.45f;           // 0 = raw, closer to 1 = smoother
+          const float NL_INV_DEADZONE = 0.13f;     // lifts small movements past the game's own deadzone
+
+          float NativeLookShape(float v) {
+          	float a = fabsf(v);
+          	if (a < 0.02f)
+          		return 0.0f;
+          	a = NL_INV_DEADZONE + (1.0f - NL_INV_DEADZONE) * std::min(1.0f, a);
+          	return v < 0.0f ? -a : a;
+          }
+
+          void NativeLookRelease() {
+          	g_nl.pointer = -1;
+          	g_nl.accX = g_nl.accY = 0.0f;
+          	g_nl.outX = g_nl.outY = 0.0f;
+          	if (g_nl.active) {
+          		__CtrlSetAnalogXY(0, 0.0f, 0.0f);
+          		g_nl.active = false;
+          	}
+          }
+
+          void NativeLookTouch(const TouchInput &input, const Bounds &zone) {
+          	if (input.flags & @RELEASE_ALL@) {
+          		NativeLookRelease();
+          		return;
+          	}
+          	if (input.flags & @DOWN@) {
+          		if (g_nl.pointer == -1 && !(usedPointerMask & (1 << input.id)) &&
+          			zone.Contains(input.x, input.y) && input.x >= g_display.dp_xres * 0.5f) {
+          			g_nl.pointer = input.id;
+          			g_nl.lastX = input.x;
+          			g_nl.lastY = input.y;
+          			g_nl.accX = g_nl.accY = 0.0f;
+          		}
+          		return;
+          	}
+          	if (input.id != g_nl.pointer)
+          		return;
+          	if (usedPointerMask & (1 << input.id)) {
+          		NativeLookRelease();  // an on-screen button took this finger
+          		return;
+          	}
+          	if (input.flags & @MOVE@) {
+          		g_nl.accX += (input.x - g_nl.lastX) * g_display.dpi_scale_x;
+          		g_nl.accY += (input.y - g_nl.lastY) * g_display.dpi_scale_y;
+          		g_nl.lastX = input.x;
+          		g_nl.lastY = input.y;
+          	}
+          	if (input.flags & @UP@)
+          		NativeLookRelease();
+          }
+
+          void NativeLookFrame() {
+          	if (g_nl.pointer == -1)
+          		return;
+          	float tx = std::max(-1.0f, std::min(1.0f, g_nl.accX / NL_PIXELS_FOR_FULL * NL_SENS));
+          	float ty = std::max(-1.0f, std::min(1.0f, -g_nl.accY / NL_PIXELS_FOR_FULL * NL_SENS * NL_INVERT_Y));
+          	g_nl.accX = 0.0f;
+          	g_nl.accY = 0.0f;
+          	g_nl.outX = g_nl.outX * NL_SMOOTH + tx * (1.0f - NL_SMOOTH);
+          	g_nl.outY = g_nl.outY * NL_SMOOTH + ty * (1.0f - NL_SMOOTH);
+          	__CtrlSetAnalogXY(0, NativeLookShape(g_nl.outX), NativeLookShape(g_nl.outY));
+          	g_nl.active = true;
+          }
+          }  // namespace
+          ''').replace('@SENS@', repr(sens)).replace('@INVY@', '-1.0' if invert else '1.0')
+
+          TOUCH_HOOK = '''
+          	// Native touch look (right zone + analog gesture only). Stock behaviour is untouched otherwise.
+          	const bool nativeLookOn = (zoneIndex_ == 1 && GetZone().bAnalogGesture);
+          	if (nativeLookOn)
+          		NativeLookTouch(input, bounds_);
+          	else if (g_nl.pointer != -1)
+          		NativeLookRelease();
+          	struct NativeLookStockGuard {
+          		bool on;
+          		explicit NativeLookStockGuard(bool o) : on(o) { if (on) __CtrlSuppressLeftStick(true); }
+          		~NativeLookStockGuard() { if (on) __CtrlSuppressLeftStick(false); }
+          	} nativeLookStockGuard(nativeLookOn);
+          '''
+
+          edit('UI/GamepadEmu.cpp', [
+            ('include cmath', r'(#include <algorithm>[^\n]*\n)', lambda m: m.group(1) + '#include <cmath>\n'),
+            ('pointer masks', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)', lambda m: m.group(1) + NL_BLOCK),
+            ('gesture touch', r'(bool GestureGamepad::Touch\(const TouchInput &input\)\s*\{)', lambda m: m.group(1) + TOUCH_HOOK),
+            ('gesture update', r'(void GestureGamepad::Update\(\)\s*\{)', lambda m: m.group(1) + '\n\tNativeLookFrame();'),
+          ])
+          print('Native look patch applied.')
+          NLPY
       - uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
