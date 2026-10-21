@@ -55,17 +55,22 @@ jobs:
 
           edit('Core/HLE/sceCtrl.cpp', [
             ('include', r'(#include <cmath>[^\n]*\n)',
-             lambda m: m.group(1) + '#include <algorithm>\n'),
+             lambda m: m.group(1) + '#include <algorithm>\n#include "Core/MemMap.h"\n'),
             ('mutex', r'(static std::mutex ctrlMutex;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look: finger movement collected since the game last read the pad.
           static float touchLookX = 0.0f;
           static float touchLookY = 0.0f;
+          // Running totals (1/16 units) published to game RAM, for cheats that cannot rely on which pad read gets the swipe.
+          static double touchTotalX = 0.0;
+          static double touchTotalY = 0.0;
 
           void __CtrlAddTouchLook(float dx, float dy) {
           	std::lock_guard<std::mutex> guard(ctrlMutex);
           	touchLookX += dx;
           	touchLookY += dy;
+          	touchTotalX += dx * 16.0;
+          	touchTotalY += dy * 16.0;
           }
           '''),
             ('read', r'(\*data = ctrlBufs\[ctrlBufRead\];[^\n]*\n)',
@@ -80,6 +85,10 @@ jobs:
           			data->unused[1] = (u8)((tx >> 8) & 0xFF);
           			data->unused[2] = (u8)(ty & 0xFF);
           			data->unused[3] = (u8)((ty >> 8) & 0xFF);
+          			if (Memory::IsValidAddress(0x08800F64)) {
+          				Memory::Write_U32((u32)(int)llround(touchTotalX), 0x08800F60);
+          				Memory::Write_U32((u32)(int)llround(touchTotalY), 0x08800F64);
+          			}
           		}
           '''),
           ])
