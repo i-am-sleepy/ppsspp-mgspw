@@ -8,12 +8,6 @@ on:
       look_buttons:
         description: 'Custom buttons that fire AND look when you hold and slide: all, none, or numbers like 1,3'
         default: 'all'
-      aim_gain:
-        description: 'Starting aim speed (can be changed later with the tuning cheat, no rebuild)'
-        default: '12'
-      aim_deadzone:
-        description: 'Starting dead zone skip (can be changed later with the tuning cheat, no rebuild)'
-        default: '30'
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -32,8 +26,6 @@ jobs:
       - name: Apply touch look patch
         env:
           LOOK_BUTTONS: ${{ github.event.inputs.look_buttons }}
-          AIM_GAIN: ${{ github.event.inputs.aim_gain }}
-          AIM_DEADZONE: ${{ github.event.inputs.aim_deadzone }}
         run: |
           python3 - <<'PY'
           import os, re, sys, pathlib
@@ -61,141 +53,9 @@ jobs:
                       mask |= 1 << (int(part) - 1)
           print('Look-enabled custom button mask: ' + hex(mask))
 
-          AIM_CPP = '''
-          // ---- Touch aim: a swipe goes straight into the LEFT stick data the game reads ----
-          // Used while the right-side gesture zone has "analog stick gesture" switched on. No on-screen stick
-          // emulation: all movement between game reads is added up, shaped to skip the game's dead zone,
-          // eased so it does not flicker, and any overflow is carried into the next read.
-          // The numbers can be changed live by a cheat that writes to game RAM at 0x08800F40 (see the tuning cheat).
-          static float touchAimX = 0.0f;
-          static float touchAimY = 0.0f;
-          static float aimCarryX = 0.0f;
-          static float aimCarryY = 0.0f;
-          static float aimPrevX = 0.0f;
-          static float aimPrevY = 0.0f;
-          static std::chrono::steady_clock::time_point lastAimEvent;
-          // While the right-side finger is down we own the left stick completely (neutral when it is not moving),
-          // so PPSSPP's own analog gesture cannot keep pushing the stick underneath.
-          static bool touchAimHeld = false;
-          static std::chrono::steady_clock::time_point aimReleasedAt;
-
-          void __CtrlSetTouchAimHeld(bool held) {
-          	std::lock_guard<std::mutex> guard(ctrlMutex);
-          	if (touchAimHeld && !held)
-          		aimReleasedAt = std::chrono::steady_clock::now();
-          	touchAimHeld = held;
-          }
-
-          void __CtrlAddTouchAim(float dx, float dy) {
-          	std::lock_guard<std::mutex> guard(ctrlMutex);
-          	touchAimX += dx;
-          	touchAimY += dy;
-          	lastAimEvent = std::chrono::steady_clock::now();
-          }
-
-          struct AimTuning {
-          	float gain;
-          	float deadzone;
-          	float curve;
-          	float smooth;
-          };
-
-          static AimTuning GetAimTuning() {
-          	AimTuning t = { @AIMGAIN@f, @DZ@f, 0.6f, 0.35f };
-          	if (Memory::IsValidAddress(0x08800F40) && Memory::Read_U32(0x08800F40) == 0x41494D31) {
-          		t.gain = (float)Memory::Read_U32(0x08800F44) / 10.0f;
-          		t.deadzone = (float)Memory::Read_U32(0x08800F48);
-          		t.curve = (float)Memory::Read_U32(0x08800F4C) / 100.0f;
-          		t.smooth = (float)Memory::Read_U32(0x08800F50) / 100.0f;
-          	}
-          	t.gain = std::max(0.1f, std::min(200.0f, t.gain));
-          	t.deadzone = std::max(0.0f, std::min(100.0f, t.deadzone));
-          	t.curve = std::max(0.2f, std::min(2.0f, t.curve));
-          	t.smooth = std::max(0.0f, std::min(0.9f, t.smooth));
-          	return t;
-          }
-
-          static float TouchAimShape(float v, float &carry, const AimTuning &t) {
-          	float m = v < 0.0f ? -v : v;
-          	if (m < 0.5f) {
-          		carry = 0.0f;
-          		return 0.0f;
-          	}
-          	float room = 127.0f - t.deadzone;
-          	float used = m < room ? m : room;
-          	float rest = m - used;
-          	if (rest > 150.0f)
-          		rest = 150.0f;
-          	carry = v < 0.0f ? -rest : rest;
-          	float out = t.deadzone + powf(used / room, t.curve) * room;
-          	return v < 0.0f ? -out : out;
-          }
-
-          template <class P>
-          static void TouchAimApply(P &pad, float ax, float ay) {
-          	auto nowT = std::chrono::steady_clock::now();
-          	bool recent = (nowT - lastAimEvent) < std::chrono::milliseconds(120);
-          	bool own = touchAimHeld || (nowT - aimReleasedAt) < std::chrono::milliseconds(150);
-          	if (!recent && !touchAimHeld) {
-          		aimPrevX = 0.0f;
-          		aimPrevY = 0.0f;
-          		aimCarryX = 0.0f;
-          		aimCarryY = 0.0f;
-          	}
-          	AimTuning t = GetAimTuning();
-          	float tx = TouchAimShape(ax * t.gain + aimCarryX, aimCarryX, t);
-          	float ty = TouchAimShape(ay * t.gain + aimCarryY, aimCarryY, t);
-          	aimPrevX = tx + (aimPrevX - tx) * t.smooth;
-          	aimPrevY = ty + (aimPrevY - ty) * t.smooth;
-          	if (tx == 0.0f && aimPrevX > -t.deadzone && aimPrevX < t.deadzone) aimPrevX = 0.0f;
-          	if (ty == 0.0f && aimPrevY > -t.deadzone && aimPrevY < t.deadzone) aimPrevY = 0.0f;
-          	if (aimPrevX > -1.0f && aimPrevX < 1.0f) aimPrevX = 0.0f;
-          	if (aimPrevY > -1.0f && aimPrevY < 1.0f) aimPrevY = 0.0f;
-          	int sx = (int)lroundf(aimPrevX);
-          	int sy = (int)lroundf(aimPrevY);
-          	if (!own && !recent && sx == 0 && sy == 0)
-          		return;
-          	u8 *raw = (u8 *)&pad->buttons - 4;
-          	raw[8] = (u8)std::max(1, std::min(255, 128 + sx));
-          	raw[9] = (u8)std::max(1, std::min(255, 128 + sy));
-          }
-          '''
-
-          aim_gain = repr(float(os.environ.get('AIM_GAIN', '12').strip() or '12'))
-          aim_deadzone = repr(float(os.environ.get('AIM_DEADZONE', '30').strip() or '30'))
-          aim_code = AIM_CPP.replace('@DZ@', aim_deadzone).replace('@AIMGAIN@', aim_gain)
-
-
-          def find_analog_field():
-              # Find the name of the "analog stick gesture" switch of a gesture zone.
-              gp = pathlib.Path('UI/GamepadEmu.cpp')
-              text = gp.read_text(encoding='utf-8', errors='ignore') if gp.exists() else ''
-              for pattern in (r'GetZone\(\)\s*\.\s*(b\w*Analog\w*)', r'\bzone\s*\.\s*(b\w*Analog\w*)',
-                              r'gestureControls\[[^\]]*\]\s*\.\s*(b\w*Analog\w*)'):
-                  m = re.search(pattern, text)
-                  if m:
-                      return m.group(1)
-              for path in list(pathlib.Path('Core').rglob('*.h')) + list(pathlib.Path('UI').rglob('*.h')) + list(pathlib.Path('Common').rglob('*.h')):
-                  try:
-                      t = path.read_text(encoding='utf-8', errors='ignore')
-                  except Exception:
-                      continue
-                  m = re.search(r'struct\s+GestureControlConfig\s*\{(.*?)\n\s*\};', t, re.S)
-                  if m:
-                      f = re.search(r'bool\s+(\w*[Aa]nalog\w*)\s*[;=\{]', m.group(1))
-                      if f:
-                          return f.group(1)
-              for n, line in enumerate(text.splitlines(), 1):
-                  if 'nalog' in line:
-                      print('GamepadEmu.cpp:%d: %s' % (n, line.strip()))
-              sys.exit('PATCH FAILED: could not find the analog gesture switch')
-
-          analog_field = find_analog_field()
-          print('Right-zone analog gesture switch: ' + analog_field)
-
           edit('Core/HLE/sceCtrl.cpp', [
             ('include', r'(#include <cmath>[^\n]*\n)',
-             lambda m: m.group(1) + '#include <algorithm>\n#include <chrono>\n#include "Core/MemMap.h"\n'),
+             lambda m: m.group(1) + '#include <algorithm>\n'),
             ('mutex', r'(static std::mutex ctrlMutex;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look: finger movement collected since the game last read the pad.
@@ -207,7 +67,7 @@ jobs:
           	touchLookX += dx;
           	touchLookY += dy;
           }
-          ''' + aim_code),
+          '''),
             ('read', r'(\*data = ctrlBufs\[ctrlBufRead\];[^\n]*\n)',
              lambda m: m.group(1) + '''
           		{
@@ -220,11 +80,6 @@ jobs:
           			data->unused[1] = (u8)((tx >> 8) & 0xFF);
           			data->unused[2] = (u8)(ty & 0xFF);
           			data->unused[3] = (u8)((ty >> 8) & 0xFF);
-          			float aimX = touchAimX;
-          			float aimY = touchAimY;
-          			touchAimX = 0.0f;
-          			touchAimY = 0.0f;
-          			TouchAimApply(data, aimX, aimY);
           		}
           '''),
           ])
@@ -238,27 +93,11 @@ jobs:
                   t = t.replace('@' + n + '@', ('TouchInputFlags::' if new_flags else 'TOUCH_') + n)
               return t
 
-          # The stock analog gesture keeps the stick pushed while a finger rests on the screen, which is the
-          # "keeps moving when I stop" problem. Switch it off here: the aim feed below replaces it.
-          _gp = pathlib.Path('UI/GamepadEmu.cpp')
-          _txt = _gp.read_text(encoding='utf-8')
-          _switched = 0
-          for _pat, _new in (
-                  (r'if \(GetZone\(\)\.' + analog_field + r' && dragPointerId_ != -1\)',
-                   'if (false && GetZone().' + analog_field + ' && dragPointerId_ != -1)'),
-                  (r'if \(zone\.' + analog_field + r'\) \{(\s*const float k = zone\.f\w*Analog\w*)',
-                   'if (false && zone.' + analog_field + r') {\1')):
-              _txt, _n = re.subn(_pat, _new, _txt)
-              _switched += _n
-          if _switched:
-              _gp.write_text(_txt, encoding='utf-8')
-          print('Stock analog gesture switched off in %d place(s).' % _switched)
-
           edit('UI/GamepadEmu.cpp', [
             ('include map', r'(#include <algorithm>[^\n]*\n)',
              lambda m: m.group(1) + '#include <cstdlib>\n#include <map>\n#include <string>\n'),
             ('include', r'(#include "UI/GamepadEmu.h"[^\n]*\n)',
-             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\nvoid __CtrlAddTouchAim(float dx, float dy);\nvoid __CtrlSetTouchAimHeld(bool held);\n'),
+             lambda m: m.group(1) + '\nvoid __CtrlAddTouchLook(float dx, float dy);\n'),
             ('statics', r'(static uint32_t analogPointerMask = 0;[^\n]*\n)',
              lambda m: m.group(1) + '''
           // Touch look on custom buttons: hold one and slide to turn the camera.
@@ -268,18 +107,16 @@ jobs:
           	float lastY = 0.0f;
           };
           static std::map<const void *, TouchLookState> g_touchLook;
-          // Which gesture zones have their analog stick gesture switched on.
-          static bool g_zoneAnalog[2] = { false, false };
-          static bool TouchAimEnabled() { return g_zoneAnalog[0] || g_zoneAnalog[1]; }
-          // Fingers currently held on fire+look buttons (those feed the aim themselves).
-          static uint32_t g_lookButtonPointers = 0;
-          // The finger the aim feed follows. It is tracked here, not through PPSSPP's own drag state,
-          // so a pause or a swipe reset in the stock gesture code cannot interrupt the aim.
-          static int g_aimPointer = -1;
-          static float g_aimLastX = 0.0f;
-          static float g_aimLastY = 0.0f;
-          static int g_aimZone = -1;
           static const unsigned long long g_touchLookMask = @MASK@ULL;
+
+          // The camera only follows fingers that START on the right half of the screen, so anything you do on the
+          // left side (a left-side analog stick gesture, for example) never moves the camera.
+          static bool g_startedRight[16] = { false };
+          static int g_lookPointer = -1;
+          static float g_lookLastX = 0.0f;
+          static float g_lookLastY = 0.0f;
+          // Fingers held on fire+look buttons (the button feeds those itself).
+          static uint32_t g_lookButtonPointers = 0;
 
           // The custom button number is read from its label, for example "Custom 3 button".
           static bool TouchLookEnabled(const UI::View *button) {
@@ -304,22 +141,23 @@ jobs:
           	if (g_touchLookMask != 0 && TouchLookEnabled(this)) {
           		TouchLookState &look = g_touchLook[this];
           		if ((input.flags & @DOWN@) && (pointerDownMask_ & (1 << input.id))) {
-          			look.pointer = input.id;
-          			g_lookButtonPointers |= 1u << input.id;
-          			look.lastX = input.x;
-          			look.lastY = input.y;
+          			if (input.x > g_display.dp_xres * 0.5f) {
+          				look.pointer = input.id;
+          				g_lookButtonPointers |= 1u << (input.id & 15);
+          				look.lastX = input.x;
+          				look.lastY = input.y;
+          			} else {
+          				look.pointer = -1;
+          			}
           		} else if ((input.flags & @MOVE@) && input.id == look.pointer && lastDown) {
           			// Stay pressed while the finger slides off the button, and turn the camera.
           			pointerDownMask_ |= 1 << input.id;
-          			if (TouchAimEnabled())
-          				__CtrlAddTouchAim((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
-          			else
-          				__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
+          			__CtrlAddTouchLook((input.x - look.lastX) * g_display.dpi_scale_x, (input.y - look.lastY) * g_display.dpi_scale_y);
           			look.lastX = input.x;
           			look.lastY = input.y;
           		}
           		if ((input.flags & @UP@) && input.id == look.pointer) {
-          			g_lookButtonPointers &= ~(1u << input.id);
+          			g_lookButtonPointers &= ~(1u << (input.id & 15));
           			look.pointer = -1;
           		}
           		if (input.flags & @RELEASE_ALL@) {
@@ -331,46 +169,37 @@ jobs:
             ('touch guard', r'(bool GestureGamepad::Touch\(const TouchInput &input\)\s*\{)',
              lambda m: m.group(1) + fl('''
 
-          	// Aim stick: follow this zone's finger ourselves, after the stock code has run.
-          	struct AimTrack {
+          	// Touch look: follow a finger that started on the right half of the screen. It is tracked here,
+          	// not through PPSSPP's own drag state, so pauses and left-side gestures cannot affect the camera.
+          	struct LookTrack {
           		GestureGamepad *self;
           		const TouchInput &in;
-          		~AimTrack() {
-          			bool on = self->GetZone().@FIELD@;
-          			g_zoneAnalog[self->zoneIndex_ & 1] = on;
-          			if (!on) {
-          				if (g_aimPointer != -1 && g_aimZone == self->zoneIndex_) {
-          					g_aimPointer = -1;
-          					__CtrlSetTouchAimHeld(false);
+          		~LookTrack() {
+          			const int slot = in.id & 15;
+          			if (in.flags & @DOWN@)
+          				g_startedRight[slot] = in.x > g_display.dp_xres * 0.5f;
+          			if (g_lookPointer == -1) {
+          				if (in.id == self->dragPointerId_ && (in.flags & @DOWN@ || in.flags & @MOVE@) && g_startedRight[slot] && !(g_lookButtonPointers & (1u << slot))) {
+          					g_lookPointer = in.id;
+          					g_lookLastX = in.x;
+          					g_lookLastY = in.y;
           				}
-          				return;
-          			}
-          			if (g_aimPointer == -1) {
-          				if (in.id == self->dragPointerId_ && (in.flags & @DOWN@ || in.flags & @MOVE@) && !(g_lookButtonPointers & (1u << in.id))) {
-          					g_aimPointer = in.id;
-          					g_aimZone = self->zoneIndex_;
-          					g_aimLastX = in.x;
-          					g_aimLastY = in.y;
-          				}
-          			} else if (g_aimZone == self->zoneIndex_ && in.id == g_aimPointer && (in.flags & @MOVE@)) {
-          				if (g_lookButtonPointers & (1u << in.id)) {
-          					g_aimPointer = -1;
+          			} else if (in.id == g_lookPointer && (in.flags & @MOVE@)) {
+          				if (g_lookButtonPointers & (1u << slot)) {
+          					g_lookPointer = -1;
           				} else {
-          					__CtrlAddTouchAim((in.x - g_aimLastX) * g_display.dpi_scale_x, (in.y - g_aimLastY) * g_display.dpi_scale_y);
-          					g_aimLastX = in.x;
-          					g_aimLastY = in.y;
+          					__CtrlAddTouchLook((in.x - g_lookLastX) * g_display.dpi_scale_x, (in.y - g_lookLastY) * g_display.dpi_scale_y);
+          					g_lookLastX = in.x;
+          					g_lookLastY = in.y;
           				}
           			}
-          			if (g_aimZone == self->zoneIndex_ && in.id == g_aimPointer && (in.flags & @UP@))
-          				g_aimPointer = -1;
+          			if (in.id == g_lookPointer && (in.flags & @UP@))
+          				g_lookPointer = -1;
           			if (in.flags & @RELEASE_ALL@)
-          				g_aimPointer = -1;
-          			__CtrlSetTouchAimHeld(g_aimPointer != -1);
+          				g_lookPointer = -1;
           		}
-          	} aimTrack{this, input};
-          '''.replace('@FIELD@', analog_field))),
-            ('drag', r'(deltaX_ \+= input\.x - lastX_;\s*deltaY_ \+= input\.y - lastY_;)(\s*lastX_ = input\.x;)',
-             lambda m: m.group(1) + '\n\t\t\tif (!GetZone().' + analog_field + ')\n\t\t\t\t__CtrlAddTouchLook((input.x - lastX_) * g_display.dpi_scale_x, (input.y - lastY_) * g_display.dpi_scale_y);' + m.group(2)),
+          	} lookTrack{this, input};
+          ''')),
           ])
           print('Patch applied.')
           PY
