@@ -117,6 +117,8 @@ jobs:
           static float g_lookLastY = 0.0f;
           // Fingers held on fire+look buttons (the button feeds those itself).
           static uint32_t g_lookButtonPointers = 0;
+          // Fingers that landed on a button; those never turn the camera.
+          static uint32_t g_buttonOwned = 0;
 
           // The custom button number is read from its label, for example "Custom 3 button".
           static bool TouchLookEnabled(const UI::View *button) {
@@ -135,6 +137,41 @@ jobs:
           	return number >= 1 && number <= 64 && ((g_touchLookMask >> (number - 1)) & 1ULL) != 0;
           }
           '''.replace('@MASK@', hex(mask))),
+            ('tracker', r'(static bool TouchLookEnabled\(const UI::View \*button\) \{[\s\S]*?\n\}\n)',
+             lambda m: m.group(1) + fl('''
+          // Camera look from the right half of the screen. It follows the finger itself, so it does not need
+          // PPSSPP's gesture zones to be switched on, and it ignores fingers that landed on a button or the stick.
+          static void TouchLookTrack(const TouchInput &in) {
+          	const int slot = in.id & 15;
+          	const uint32_t bit = 1u << slot;
+          	if (in.flags & @DOWN@)
+          		g_startedRight[slot] = in.x > g_display.dp_xres * 0.5f;
+          	if (g_lookPointer == -1) {
+          		if ((in.flags & @MOVE@) && g_startedRight[slot] && !((g_buttonOwned | g_lookButtonPointers) & bit) && !(analogPointerMask & (1u << (in.id & 31)))) {
+          			g_lookPointer = in.id;
+          			g_lookLastX = in.x;
+          			g_lookLastY = in.y;
+          		}
+          	} else if (in.id == g_lookPointer && (in.flags & @MOVE@)) {
+          		if ((g_buttonOwned | g_lookButtonPointers) & bit) {
+          			g_lookPointer = -1;
+          		} else {
+          			__CtrlAddTouchLook((in.x - g_lookLastX) * g_display.dpi_scale_x, (in.y - g_lookLastY) * g_display.dpi_scale_y);
+          			g_lookLastX = in.x;
+          			g_lookLastY = in.y;
+          		}
+          	}
+          	if (in.flags & @UP@) {
+          		if (in.id == g_lookPointer)
+          			g_lookPointer = -1;
+          		g_buttonOwned &= ~bit;
+          	}
+          	if (in.flags & @RELEASE_ALL@) {
+          		g_lookPointer = -1;
+          		g_buttonOwned = 0;
+          	}
+          }
+          ''')),
             ('custom touch', r'(bool CustomButton::Touch\(const TouchInput &input\) \{\s*using namespace CustomKeyData;\s*bool lastDown = pointerDownMask_ != 0;\s*bool retval = MultiTouchButton::Touch\(input\);)',
              lambda m: m.group(1) + fl('''
 
@@ -167,40 +204,28 @@ jobs:
           	}
           ''')),
             ('touch guard', r'(bool GestureGamepad::Touch\(const TouchInput &input\)\s*\{)',
-             lambda m: m.group(1) + fl('''
-
-          	// Touch look: follow a finger that started on the right half of the screen. It is tracked here,
-          	// not through PPSSPP's own drag state, so pauses and left-side gestures cannot affect the camera.
-          	struct LookTrack {
-          		GestureGamepad *self;
-          		const TouchInput &in;
-          		~LookTrack() {
-          			const int slot = in.id & 15;
-          			if (in.flags & @DOWN@)
-          				g_startedRight[slot] = in.x > g_display.dp_xres * 0.5f;
-          			if (g_lookPointer == -1) {
-          				if (in.id == self->dragPointerId_ && (in.flags & @DOWN@ || in.flags & @MOVE@) && g_startedRight[slot] && !(g_lookButtonPointers & (1u << slot))) {
-          					g_lookPointer = in.id;
-          					g_lookLastX = in.x;
-          					g_lookLastY = in.y;
-          				}
-          			} else if (in.id == g_lookPointer && (in.flags & @MOVE@)) {
-          				if (g_lookButtonPointers & (1u << slot)) {
-          					g_lookPointer = -1;
-          				} else {
-          					__CtrlAddTouchLook((in.x - g_lookLastX) * g_display.dpi_scale_x, (in.y - g_lookLastY) * g_display.dpi_scale_y);
-          					g_lookLastX = in.x;
-          					g_lookLastY = in.y;
-          				}
-          			}
-          			if (in.id == g_lookPointer && (in.flags & @UP@))
-          				g_lookPointer = -1;
-          			if (in.flags & @RELEASE_ALL@)
-          				g_lookPointer = -1;
-          		}
-          	} lookTrack{this, input};
-          ''')),
+             lambda m: m.group(1) + '\n\tTouchLookTrack(input);\n'),
           ])
+          # Buttons tell the tracker which fingers landed on them, and run it too, so the camera feed also works
+          # when no gesture zone is switched on.
+          _gp = pathlib.Path('UI/GamepadEmu.cpp')
+          _txt = _gp.read_text(encoding='utf-8')
+          _txt, _n = re.subn(r'(bool MultiTouchButton::Touch\(const TouchInput &input\)\s*\{)',
+                             lambda m: m.group(1) + fl('''
+          	struct OwnGuard {
+          		MultiTouchButton *self;
+          		const TouchInput &in;
+          		~OwnGuard() {
+          			if ((in.flags & @DOWN@) && (self->pointerDownMask_ & (1 << in.id)))
+          				g_buttonOwned |= 1u << (in.id & 15);
+          			TouchLookTrack(in);
+          		}
+          	} ownGuard{this, input};
+          '''), _txt, count=1)
+          if _n == 1:
+              _gp.write_text(_txt, encoding='utf-8')
+          else:
+              print('Note: button ownership hook not found (the camera then relies on gesture zones being on).')
           print('Patch applied.')
           PY
       - uses: actions/setup-java@v4
